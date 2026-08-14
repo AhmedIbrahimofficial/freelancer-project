@@ -1,0 +1,54 @@
+*.log
+.DS_Store
+.env
+.env.backup
+.env.production
+.phpactor.json
+.phpunit.result.cache
+/.codex
+/.cursor/
+/.idea
+/.nova
+/.phpunit.cache
+/.vscode
+/.zed
+/auth.json
+/node_modules
+/public/build
+/public/fonts-manifest.dev.json
+/public/hot
+/public/storage
+/storage/*.key
+/storage/pail
+/vendor
+_ide_helper.php
+Homestead.json
+Homestead.yaml
+Thumbs.db
+
+# SQLite database (contains real data — never commit)
+/database/database.sqlite
+/database/*.sqlite
+
+# Stripe CLI helper scripts (temp files)
+stripe.bat
+topup.php
+add-test-balance.php
+enable-transfers.php
+
+# PHPUnit cache
+.phpunit.result.cache
+
+# Laravel compiled files
+/bootstrap/cache/*.php
+!/bootstrap/cache/.gitignore
+
+# Frontend node_modules and build output
+/secure-milestone-hub/node_modules
+/secure-milestone-hub/dist
+/secure-milestone-hub/.output
+/secure-milestone-hub/.vinxi
+/secure-milestone-hub/.tanstack
+/secure-milestone-hub/.nitro
+/secure-milestone-hub/.env.local
+/secure-milestone-hub/.env.*.local
