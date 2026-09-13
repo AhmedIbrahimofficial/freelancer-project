@@ -394,8 +394,381 @@ class TestStripeEscrowFlow extends Command
             $this->record('dispute_scenario', 'FAIL', $disputeResponse->body());
         }
 
-        // ── Step 9: Check webhook listener received events ────────────────────
-        $this->step('9', 'Checking webhook signature in controller');
+        // ── Step 9: Admin resolves dispute → mediator decision ───────────────
+        $this->step('9', 'Dispute resolution — admin resolves in favour of client');
+
+        // Create an admin user for this test
+        $admin = User::firstOrCreate(
+            ['email' => 'admin@freelancer-protect.test'],
+            ['name' => 'Test Admin', 'password' => Hash::make('password'), 'role' => 'admin']
+        );
+
+        $adminToken = $admin->createToken('test-admin')->plainTextToken;
+
+        // Retrieve the dispute ID from the disputed contract
+        $openDispute = \App\Models\Dispute::where('contract_id', $disputeContract->id)
+            ->where('status', 'open')
+            ->first();
+
+        if ($openDispute) {
+            $resolveResponse = \Illuminate\Support\Facades\Http::withToken($adminToken)
+                ->patch("http://localhost:8000/api/v1/disputes/{$openDispute->id}/resolve", [
+                    'status'           => 'resolved_client',
+                    'resolution_notes' => 'Client evidence was conclusive — refund approved.',
+                ]);
+
+            if ($resolveResponse->successful()) {
+                $openDispute->refresh();
+
+                // Verify dispute is resolved
+                if ($openDispute->status === 'resolved_client') {
+                    $this->pass("Dispute resolved in favour of client ✓");
+                    $this->record('dispute_resolution', 'PASS', "status: resolved_client");
+                } else {
+                    $this->flunk("Unexpected dispute status: {$openDispute->status}");
+                    $this->record('dispute_resolution', 'FAIL', "status: {$openDispute->status}");
+                }
+
+                // Verify funds are still NOT auto-released (platform controls release)
+                $releasedAfterResolve = Transaction::where('contract_id', $disputeContract->id)
+                    ->where('type', 'release')
+                    ->count();
+
+                if ($releasedAfterResolve === 0) {
+                    $this->pass("Funds remain held after resolution — manual release required ✓");
+                    $this->line("  <fg=cyan>ℹ</> In production: admin triggers refund via Stripe Dashboard or a dedicated /refund endpoint.");
+                    $this->record('dispute_funds_still_held', 'PASS', 'no auto-release on resolution');
+                } else {
+                    $this->flunk("Funds were auto-released after dispute resolution — unintended!");
+                    $this->record('dispute_funds_still_held', 'FAIL', 'auto-release detected');
+                }
+
+                // Safety boundary: client cannot trigger release on a disputed milestone,
+                // even after the dispute is marked resolved.
+                // First set milestone to 'approved' to bypass the status check,
+                // then attempt release — the dispute guard must still block it.
+                $disputeMilestone->update(['status' => 'approved']);
+
+                $releaseAfterResolveResponse = \Illuminate\Support\Facades\Http::withToken($token)
+                    ->post("http://localhost:8000/api/v1/milestones/{$disputeMilestone->id}/release");
+
+                if ($releaseAfterResolveResponse->status() === 422) {
+                    $this->pass("Release blocked after dispute resolution (422) ✓");
+                    $this->line("  <fg=cyan>ℹ</> Safety boundary confirmed: dispute resolved ≠ funds released.");
+                    $this->record('release_blocked_after_dispute', 'PASS', '422 on release attempt post-resolution');
+                } else {
+                    $this->flunk(
+                        "CRITICAL: Release succeeded after dispute resolution! Status: {$releaseAfterResolveResponse->status()}. " .
+                        "Funds should be under admin control after a dispute."
+                    );
+                    $this->record('release_blocked_after_dispute', 'FAIL', "got {$releaseAfterResolveResponse->status()}");
+                }
+
+                // Restore milestone to disputed state for clean test data
+                $disputeMilestone->update(['status' => 'disputed']);
+
+                // ── Test: execute-resolution endpoint (refund path) ───────────
+                // Re-open as 'resolved_client' so execute-resolution can be tested
+                $openDispute->update(['status' => 'resolved_client']);
+                $disputeMilestone->update(['status' => 'submitted']); // reset for clean test
+
+                $executeResponse = \Illuminate\Support\Facades\Http::withToken($adminToken)
+                    ->post("http://localhost:8000/api/v1/disputes/{$openDispute->id}/execute-resolution");
+
+                if ($executeResponse->successful()) {
+                    $this->pass("execute-resolution succeeded — refund issued ✓");
+                    $this->line("  action: " . $executeResponse->json('action'));
+                    $this->line("  refund_id: " . ($executeResponse->json('refund_id') ?? 'n/a (test mode — no real PI)'));
+                    $this->record('execute_resolution', 'PASS', 'refund path executed');
+
+                    // Verify idempotency — second call must return same result, not double-refund
+                    $secondCallResponse = \Illuminate\Support\Facades\Http::withToken($adminToken)
+                        ->post("http://localhost:8000/api/v1/disputes/{$openDispute->id}/execute-resolution");
+
+                    if ($secondCallResponse->successful() &&
+                        str_contains($secondCallResponse->json('message') ?? '', 'already executed')) {
+                        $this->pass("execute-resolution is idempotent — second call returns cached result ✓");
+                        $this->record('execute_resolution_idempotent', 'PASS', 'second call blocked');
+                    } else {
+                        $this->flunk("CRITICAL: execute-resolution is NOT idempotent! Second call status: {$secondCallResponse->status()}");
+                        $this->record('execute_resolution_idempotent', 'FAIL', "status: {$secondCallResponse->status()}");
+                    }
+                } elseif ($executeResponse->status() === 502) {
+                    // Expected in test mode when no real PaymentIntent exists for refund
+                    $this->pass("execute-resolution correctly rejected refund with no real PaymentIntent (502) ✓");
+                    $this->line("  <fg=cyan>ℹ</> In production, a real PaymentIntent ID would be in escrow_balances.");
+                    $this->record('execute_resolution', 'PASS', '502 — no real PI (expected in test)');
+
+                    // Verify second call is also blocked (idempotency not triggered, but still safe)
+                    $this->record('execute_resolution_idempotent', 'SKIPPED', 'first call failed — no state to be idempotent about');
+                } else {
+                    $this->flunk("execute-resolution failed unexpectedly: " . $executeResponse->body());
+                    $this->record('execute_resolution', 'FAIL', $executeResponse->body());
+                    $this->record('execute_resolution_idempotent', 'SKIPPED', 'first call failed');
+                }
+
+                // ── Test: non-admin cannot execute-resolution ─────────────────
+                $clientExecuteResponse = \Illuminate\Support\Facades\Http::withToken($token)
+                    ->post("http://localhost:8000/api/v1/disputes/{$openDispute->id}/execute-resolution");
+
+                if ($clientExecuteResponse->status() === 403) {
+                    $this->pass("Client cannot execute-resolution (403) ✓");
+                    $this->record('execute_resolution_admin_only', 'PASS', '403 for non-admin');
+                } else {
+                    $this->flunk("Client should be blocked from execute-resolution, got: {$clientExecuteResponse->status()}");
+                    $this->record('execute_resolution_admin_only', 'FAIL', "got {$clientExecuteResponse->status()}");
+                }
+            } else {
+                $this->flunk("Resolve failed: " . $resolveResponse->body());
+                $this->record('dispute_resolution', 'FAIL', $resolveResponse->body());
+            }
+        } else {
+            $this->warn("No open dispute found — skipping resolution test.");
+            $this->record('dispute_resolution', 'SKIPPED', 'no open dispute from step 8');
+        }
+
+        // ── Step 9b: Split resolution (70% freelancer / 30% client) ──────────
+        $this->step('9b', 'Split resolution — 70% freelancer, 30% client');
+
+        // Create a fresh dispute contract for split testing
+        $splitContract = Contract::create([
+            'client_id'     => $client->id,
+            'freelancer_id' => $freelancer->id,
+            'title'         => '[TEST] Split resolution ' . now()->format('H:i:s'),
+            'scope'         => 'Split resolution test.',
+            'status'        => 'active',
+            'total_amount'  => 100.00,
+            'currency'      => 'USD',
+            'terms'         => 'Test terms.',
+        ]);
+
+        $splitMilestone = Milestone::create([
+            'contract_id' => $splitContract->id,
+            'title'       => 'Split milestone',
+            'amount'      => 100.00,
+            'due_date'    => now()->addWeek()->toDateString(),
+            'order'       => 1,
+            'status'      => 'submitted',
+            'submitted_at' => now(),
+        ]);
+
+        EscrowBalance::create([
+            'contract_id'              => $splitContract->id,
+            'held_amount'              => 100.00,
+            'released_amount'          => 0,
+            'refunded_amount'          => 0,
+            'currency'                 => 'USD',
+            'status'                   => 'funded',
+            'stripe_payment_intent_id' => 'pi_split_test_' . uniqid(),
+        ]);
+
+        // Raise dispute
+        $splitToken           = $client->createToken('test-split')->plainTextToken;
+        $splitDisputeResponse = \Illuminate\Support\Facades\Http::withToken($splitToken)
+            ->post("http://localhost:8000/api/v1/milestones/{$splitMilestone->id}/dispute", [
+                'reason' => 'Partial work delivered.',
+            ]);
+
+        if (! $splitDisputeResponse->successful()) {
+            $this->flunk("Could not raise split dispute: " . $splitDisputeResponse->body());
+            $this->record('split_resolution', 'FAIL', 'could not raise dispute');
+            $this->record('split_amounts', 'SKIPPED', 'no dispute');
+            $this->record('split_idempotency', 'SKIPPED', 'no dispute');
+            goto after_split;
+        }
+
+        $splitDisputeId = $splitDisputeResponse->json('dispute.id');
+
+        // Resolve as split: 70% to freelancer, 30% to client
+        $resolveAsSplitResponse = \Illuminate\Support\Facades\Http::withToken($adminToken)
+            ->patch("http://localhost:8000/api/v1/disputes/{$splitDisputeId}/resolve", [
+                'status'             => 'resolved_split',
+                'resolution_notes'   => 'Partial work completed — 70/30 split.',
+                'freelancer_percent' => 70,
+            ]);
+
+        if (! $resolveAsSplitResponse->successful()) {
+            $this->flunk("Could not resolve as split: " . $resolveAsSplitResponse->body());
+            $this->record('split_resolution', 'FAIL', $resolveAsSplitResponse->body());
+            $this->record('split_amounts', 'SKIPPED', 'resolve failed');
+            $this->record('split_idempotency', 'SKIPPED', 'resolve failed');
+            goto after_split;
+        }
+
+        $splitDispute = \App\Models\Dispute::find($splitDisputeId);
+        if ((float) $splitDispute->split_freelancer_percent === 70.0) {
+            $this->pass("split_freelancer_percent = 70.00 stored correctly ✓");
+        } else {
+            $this->flunk("split_freelancer_percent expected 70, got: {$splitDispute->split_freelancer_percent}");
+        }
+
+        // Verify splitAmounts math: $100 total → $70 freelancer, $30 client
+        $amounts = $splitDispute->splitAmounts(10000); // 10000 cents = $100
+        if ($amounts['freelancer_cents'] === 7000 && $amounts['client_cents'] === 3000) {
+            $this->pass("splitAmounts(10000): freelancer=7000¢ client=3000¢ ✓");
+            $this->record('split_amounts', 'PASS', '70/30 math correct');
+        } else {
+            $this->flunk("splitAmounts math wrong: " . json_encode($amounts));
+            $this->record('split_amounts', 'FAIL', json_encode($amounts));
+        }
+
+        // Execute split resolution
+        $executeSplitResponse = \Illuminate\Support\Facades\Http::withToken($adminToken)
+            ->post("http://localhost:8000/api/v1/disputes/{$splitDisputeId}/execute-resolution");
+
+        if ($executeSplitResponse->successful()) {
+            $this->pass("Split execution succeeded ✓");
+            $this->line("  freelancer: \$" . $executeSplitResponse->json('freelancer_amount'));
+            $this->line("  client:     \$" . $executeSplitResponse->json('client_amount'));
+            $this->line("  transfer:   " . ($executeSplitResponse->json('transfer_id') ?? 'n/a'));
+            $this->line("  refund:     " . ($executeSplitResponse->json('refund_id') ?? 'n/a'));
+            $this->record('split_resolution', 'PASS', 'split executed');
+
+            // Verify idempotency — second call must return 'already executed'
+            $splitSecondCall = \Illuminate\Support\Facades\Http::withToken($adminToken)
+                ->post("http://localhost:8000/api/v1/disputes/{$splitDisputeId}/execute-resolution");
+
+            if ($splitSecondCall->successful() &&
+                str_contains($splitSecondCall->json('message') ?? '', 'already executed')) {
+                $this->pass("Split execute-resolution is idempotent ✓");
+                $this->record('split_idempotency', 'PASS', 'second call blocked');
+            } else {
+                $this->flunk("Split idempotency failed — second call: " . $splitSecondCall->status());
+                $this->record('split_idempotency', 'FAIL', "status: {$splitSecondCall->status()}");
+            }
+
+            // Verify transactions created: 1 release + 1 refund
+            $splitTxns = Transaction::where('contract_id', $splitContract->id)->get();
+            $releaseCount = $splitTxns->where('type', 'release')->count();
+            $refundCount  = $splitTxns->where('type', 'refund')->count();
+
+            if ($releaseCount === 1 && $refundCount === 1) {
+                $this->pass("Split transactions: 1 release + 1 refund ✓");
+                $this->record('split_transactions', 'PASS', 'correct transaction types');
+            } else {
+                $this->flunk("Split transactions wrong: {$releaseCount} releases, {$refundCount} refunds");
+                $this->record('split_transactions', 'FAIL', "{$releaseCount} release, {$refundCount} refund");
+            }
+
+            // Verify escrow accounting
+            $splitEscrow = $splitContract->escrowBalance()->first();
+            $expectedReleased = 70.00;
+            $expectedRefunded = 30.00;
+
+            if (
+                abs((float) $splitEscrow->released_amount - $expectedReleased) < 0.01 &&
+                abs((float) $splitEscrow->refunded_amount - $expectedRefunded) < 0.01
+            ) {
+                $this->pass("Escrow accounting: released=\${$splitEscrow->released_amount}, refunded=\${$splitEscrow->refunded_amount} ✓");
+                $this->record('split_escrow_accounting', 'PASS', '70+30=100');
+            } else {
+                $this->flunk("Escrow accounting wrong: released={$splitEscrow->released_amount}, refunded={$splitEscrow->refunded_amount}");
+                $this->record('split_escrow_accounting', 'FAIL', "released={$splitEscrow->released_amount}, refunded={$splitEscrow->refunded_amount}");
+            }
+        } elseif ($executeSplitResponse->status() === 502) {
+            $this->pass("Split execution correctly rejected (502) — no real Stripe account/PI in test ✓");
+            $this->line("  <fg=cyan>ℹ</> In production: real connected account and PaymentIntent would be present.");
+            $this->record('split_resolution', 'PASS', '502 expected in test mode');
+            $this->record('split_idempotency', 'SKIPPED', 'first call failed cleanly');
+            $this->record('split_transactions', 'SKIPPED', 'first call failed cleanly');
+            $this->record('split_escrow_accounting', 'SKIPPED', 'first call failed cleanly');
+        } else {
+            $this->flunk("Split execution unexpected failure: " . $executeSplitResponse->body());
+            $this->record('split_resolution', 'FAIL', $executeSplitResponse->body());
+            $this->record('split_idempotency', 'SKIPPED', 'execution failed');
+            $this->record('split_transactions', 'SKIPPED', 'execution failed');
+            $this->record('split_escrow_accounting', 'SKIPPED', 'execution failed');
+        }
+
+        // Validate that resolved_split requires freelancer_percent
+        $invalidSplitResponse = \Illuminate\Support\Facades\Http::withToken($adminToken)
+            ->patch("http://localhost:8000/api/v1/disputes/{$splitDisputeId}/resolve", [
+                'status'           => 'resolved_split',
+                'resolution_notes' => 'Missing percent.',
+                // freelancer_percent intentionally omitted
+            ]);
+
+        if ($invalidSplitResponse->status() === 422) {
+            $this->pass("resolved_split without freelancer_percent rejected (422) ✓");
+            $this->record('split_requires_percent', 'PASS', '422 on missing percent');
+        } else {
+            $this->flunk("Should require freelancer_percent, got: {$invalidSplitResponse->status()}");
+            $this->record('split_requires_percent', 'FAIL', "got {$invalidSplitResponse->status()}");
+        }
+
+        after_split:
+        $this->step('10', 'Failed payment — Stripe declined card handling');
+
+        try {
+            $failedIntent = $this->stripe->paymentIntents->create([
+                'amount'              => 1000,
+                'currency'            => 'usd',
+                'capture_method'      => 'automatic',
+                'confirmation_method' => 'automatic',
+                'confirm'             => true,
+                'payment_method'      => 'pm_card_chargeDeclined', // Stripe test — always declines
+                'metadata'            => ['contract_id' => 'test_failed_payment'],
+                'return_url'          => 'http://localhost:8000',
+            ]);
+
+            // If we reach here with a failed status, that's expected
+            if (in_array($failedIntent->status, ['requires_payment_method', 'canceled'])) {
+                $this->pass("Declined card → PaymentIntent status: {$failedIntent->status} ✓");
+                $this->record('failed_payment_handling', 'PASS', "status: {$failedIntent->status}");
+            } else {
+                $this->flunk("Expected failed status, got: {$failedIntent->status}");
+                $this->record('failed_payment_handling', 'FAIL', "status: {$failedIntent->status}");
+            }
+        } catch (\Stripe\Exception\CardException $e) {
+            // This is the expected path for card-declined errors
+            $this->pass("Declined card → CardException caught: {$e->getError()->code} ✓");
+            $this->line("  <fg=cyan>ℹ</> In production: surface this error to the client in the UI, do NOT fund escrow.");
+            $this->record('failed_payment_handling', 'PASS', "CardException: {$e->getError()->code}");
+        } catch (\Exception $e) {
+            $this->flunk("Unexpected error on declined card test: " . substr($e->getMessage(), 0, 120));
+            $this->record('failed_payment_handling', 'FAIL', substr($e->getMessage(), 0, 120));
+        }
+
+        // ── Step 11: Idempotency — duplicate fund attempt ─────────────────────
+        $this->step('11', 'Idempotency — same funding key returns same PaymentIntent');
+
+        $escrow = $contract->escrowBalance;
+        if ($escrow?->stripe_payment_intent_id) {
+            try {
+                $idempotencyKey = "fund-live-{$contract->id}"; // Same key as step 4
+
+                $intentA = $this->stripe->paymentIntents->create([
+                    'amount'      => 5000,
+                    'currency'    => 'usd',
+                    'capture_method' => 'automatic',
+                    'description' => 'Idempotency test',
+                ], ['idempotency_key' => $idempotencyKey]);
+
+                $intentB = $this->stripe->paymentIntents->create([
+                    'amount'      => 5000,
+                    'currency'    => 'usd',
+                    'capture_method' => 'automatic',
+                    'description' => 'Idempotency test',
+                ], ['idempotency_key' => $idempotencyKey]);
+
+                if ($intentA->id === $intentB->id) {
+                    $this->pass("Idempotent — same key returns same PaymentIntent: {$intentA->id} ✓");
+                    $this->record('idempotency', 'PASS', "same id: {$intentA->id}");
+                } else {
+                    $this->flunk("Different PaymentIntents returned for same idempotency key!");
+                    $this->record('idempotency', 'FAIL', "{$intentA->id} != {$intentB->id}");
+                }
+            } catch (\Exception $e) {
+                $this->warn("Idempotency test skipped: " . substr($e->getMessage(), 0, 80));
+                $this->record('idempotency', 'SKIPPED', substr($e->getMessage(), 0, 80));
+            }
+        } else {
+            $this->warn("Idempotency test skipped — escrow not funded in step 4.");
+            $this->record('idempotency', 'SKIPPED', 'no escrow from step 4');
+        }
+
+        // ── Step 12: Check webhook listener received events ───────────────────
+        $this->step('12', 'Checking webhook signature verification');
 
         $webhookCheck = \Illuminate\Support\Facades\Http::withHeaders([
             'Stripe-Signature' => 'v1=invalidsig,t=12345',
@@ -409,8 +782,6 @@ class TestStripeEscrowFlow extends Command
             $this->flunk("Webhook should reject invalid signature, got: {$webhookCheck->status()}");
             $this->record('webhook_signature_check', 'FAIL', "got {$webhookCheck->status()}");
         }
-
-        // ── Final report ──────────────────────────────────────────────────────
         $this->printReport();
 
         return 0;

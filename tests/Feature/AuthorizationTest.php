@@ -277,12 +277,80 @@ class AuthorizationTest extends TestCase
             'reason'       => 'Issue.',
         ]);
 
+        // Verify admin can resolve with a non-split status (no freelancer_percent needed)
+        $this->actingAs($admin)
+            ->patchJson("/api/v1/disputes/{$dispute->id}/resolve", [
+                'status'           => 'resolved_client',
+                'resolution_notes' => 'Admin reviewed evidence and resolved in favour of client.',
+            ])
+            ->assertOk()
+            ->assertJsonPath('dispute.status', 'resolved_client');
+    }
+
+    public function test_admin_role_can_resolve_dispute_as_split_with_percent(): void
+    {
+        $admin      = User::factory()->admin()->create();
+        $client     = User::factory()->client()->create();
+        $freelancer = User::factory()->freelancer()->create();
+
+        $contract = Contract::factory()->disputed()->create([
+            'client_id'    => $client->id,
+            'freelancer_id' => $freelancer->id,
+        ]);
+
+        $milestone = Milestone::factory()->disputed()->create([
+            'contract_id' => $contract->id,
+        ]);
+
+        $dispute = Dispute::create([
+            'contract_id'  => $contract->id,
+            'milestone_id' => $milestone->id,
+            'raised_by'    => $client->id,
+            'status'       => 'open',
+            'reason'       => 'Issue.',
+        ]);
+
+        $this->actingAs($admin)
+            ->patchJson("/api/v1/disputes/{$dispute->id}/resolve", [
+                'status'             => 'resolved_split',
+                'resolution_notes'   => 'Split the difference 70/30.',
+                'freelancer_percent' => 70,
+            ])
+            ->assertOk()
+            ->assertJsonPath('dispute.status', 'resolved_split');
+    }
+
+    public function test_resolved_split_without_freelancer_percent_returns_422(): void
+    {
+        $admin      = User::factory()->admin()->create();
+        $client     = User::factory()->client()->create();
+        $freelancer = User::factory()->freelancer()->create();
+
+        $contract = Contract::factory()->disputed()->create([
+            'client_id'    => $client->id,
+            'freelancer_id' => $freelancer->id,
+        ]);
+
+        $milestone = Milestone::factory()->disputed()->create([
+            'contract_id' => $contract->id,
+        ]);
+
+        $dispute = Dispute::create([
+            'contract_id'  => $contract->id,
+            'milestone_id' => $milestone->id,
+            'raised_by'    => $client->id,
+            'status'       => 'open',
+            'reason'       => 'Issue.',
+        ]);
+
         $this->actingAs($admin)
             ->patchJson("/api/v1/disputes/{$dispute->id}/resolve", [
                 'status'           => 'resolved_split',
-                'resolution_notes' => 'Split the difference.',
+                'resolution_notes' => 'Split without percent.',
+                // freelancer_percent intentionally omitted — must return 422
             ])
-            ->assertOk();
+            ->assertStatus(422)
+            ->assertJsonValidationErrors('freelancer_percent');
     }
 
     // ── Only admin can trigger AI summaries ──────────────────────────

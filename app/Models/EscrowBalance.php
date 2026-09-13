@@ -34,8 +34,25 @@ class EscrowBalance extends Model
         return $this->belongsTo(Contract::class);
     }
 
-    public function availableAmount(): float
+    /**
+     * Returns the available (unreleased, unrefunded) amount as a string
+     * using BCMath for exact decimal arithmetic.
+     *
+     * Never use PHP float arithmetic on financial values — floats cannot
+     * exactly represent most decimal fractions, which causes rounding drift
+     * (e.g. 100.00 - 70.00 - 30.00 can produce 4.547e-13 instead of 0.00).
+     *
+     * Callers that need cents: (int) bcmul($escrow->availableAmount(), '100', 0)
+     */
+    public function availableAmount(): string
     {
-        return (float) $this->held_amount - (float) $this->released_amount - (float) $this->refunded_amount;
+        $held     = (string) $this->held_amount;
+        $released = (string) $this->released_amount;
+        $refunded = (string) $this->refunded_amount;
+
+        $available = bcsub(bcsub($held, $released, 2), $refunded, 2);
+
+        // Never return a negative balance — defensive against data inconsistency
+        return bccomp($available, '0', 2) < 0 ? '0.00' : $available;
     }
 }

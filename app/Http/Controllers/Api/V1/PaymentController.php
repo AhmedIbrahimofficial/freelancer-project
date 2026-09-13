@@ -47,6 +47,26 @@ class PaymentController extends Controller
     }
 
     /**
+     * GET /api/v1/connect/refresh
+     * Stripe redirects here when the onboarding link expires — re-generate a fresh one.
+     */
+    public function connectRefresh(Request $request): JsonResponse
+    {
+        $user    = $request->user();
+        $account = $user->paymentAccount;
+
+        abort_if(! $account?->stripe_account_id, 422, 'No Stripe account found. Start onboarding first.');
+
+        $link = $this->stripe->createAccountLink(
+            $account->stripe_account_id,
+            url('/api/v1/connect/refresh'),
+            url('/api/v1/connect/return'),
+        );
+
+        return response()->json(['onboarding_url' => $link->url]);
+    }
+
+    /**
      * GET /api/v1/connect/return
      * Stripe redirects here after onboarding completes.
      */
@@ -77,6 +97,10 @@ class PaymentController extends Controller
      * POST /api/v1/contracts/{id}/fund
      * Client funds the escrow — creates a Stripe PaymentIntent (manual capture).
      * Status stays "held" until the webhook payment_intent.succeeded fires.
+     *
+     * If the freelancer has already connected their Stripe account, the PaymentIntent
+     * is created on_behalf_of that account so funds can be transferred without an
+     * extra transfer step. Platform fee (STRIPE_PLATFORM_FEE_PERCENT) is applied.
      */
     public function fund(Request $request, Contract $contract): JsonResponse
     {
@@ -86,17 +110,26 @@ class PaymentController extends Controller
         abort_if($contract->status !== 'active', 422, 'Contract must be active before funding.');
         abort_if($contract->escrowBalance?->status === 'funded', 422, 'Contract is already funded.');
 
-        $amountCents    = (int) round((float) $contract->total_amount * 100);
-        $idempotencyKey = "fund-{$contract->id}";
+        $amountCents       = (int) round((float) $contract->total_amount * 100);
+        $idempotencyKey    = "fund-{$contract->id}";
+
+        // Optional: route directly to freelancer's connected account if already onboarded
+        $freelancerAccount = $contract->freelancer?->paymentAccount?->stripe_account_id;
+        $feePercent        = (float) config('services.stripe.platform_fee_percent', 0);
+        $feeCents          = $freelancerAccount && $feePercent > 0
+            ? (int) round($amountCents * ($feePercent / 100))
+            : 0;
 
         $intent = $this->stripe->createPaymentIntent(
             $amountCents,
             $contract->currency,
             $contract->id,
             $idempotencyKey,
+            $freelancerAccount,
+            $feeCents,
         );
 
-        DB::transaction(function () use ($contract, $intent) {
+        DB::transaction(function () use ($contract, $intent, $feeCents) {
             EscrowBalance::updateOrCreate(
                 ['contract_id' => $contract->id],
                 [
@@ -115,6 +148,9 @@ class PaymentController extends Controller
                 'currency'         => $contract->currency,
                 'stripe_reference' => $intent->id,
                 'status'           => 'pending', // updated to 'completed' via webhook
+                'notes'            => $feeCents > 0
+                    ? "Platform fee: {$feeCents} cents applied."
+                    : null,
             ]);
         });
 
@@ -140,6 +176,17 @@ class PaymentController extends Controller
         abort_if($user->id !== $contract->client_id, 403, 'Only the client can release funds.');
         abort_if($milestone->status !== 'approved', 422, 'Milestone must be approved before releasing funds.');
 
+        // Safety boundary: never release funds if ANY dispute exists on this milestone,
+        // even if the dispute is already resolved. Resolved disputes require an explicit
+        // admin action — not a client-triggered release. This prevents accidental double-
+        // payment or release after a refund decision.
+        $dispute = $milestone->disputes()->first();
+        abort_if(
+            $dispute !== null,
+            422,
+            'This milestone has a dispute on record. Funds can only be released by an admin after dispute resolution.'
+        );
+
         $freelancer = $contract->freelancer;
         abort_if(
             ! $freelancer?->paymentAccount?->stripe_account_id,
@@ -150,8 +197,11 @@ class PaymentController extends Controller
         $amountCents    = (int) round((float) $milestone->amount * 100);
         $idempotencyKey = "release-{$milestone->id}";
 
-        DB::transaction(function () use ($milestone, $contract, $freelancer, $amountCents, $idempotencyKey) {
-            // 1. Create the Stripe transfer
+        // Stripe call is OUTSIDE the DB transaction intentionally.
+        // Pattern: call Stripe first (idempotent key protects against duplicates),
+        // then persist to DB. If DB write fails after Stripe succeeds, we log critical
+        // and the idempotency key prevents double-transfer on retry.
+        try {
             $transfer = $this->stripe->createTransfer(
                 $amountCents,
                 $contract->currency,
@@ -159,28 +209,47 @@ class PaymentController extends Controller
                 $milestone->id,
                 $idempotencyKey,
             );
-
-            // 2. Update milestone status
-            $milestone->update(['status' => 'released']);
-
-            // 3. Record the transaction
-            Transaction::create([
-                'contract_id'       => $contract->id,
-                'milestone_id'      => $milestone->id,
-                'initiated_by'      => $contract->client_id,
-                'type'              => 'release',
-                'amount'            => $milestone->amount,
-                'currency'          => $contract->currency,
-                'stripe_transfer_id' => $transfer->id,
-                'status'            => 'completed',
+        } catch (\Stripe\Exception\InvalidRequestException $e) {
+            Log::error("Stripe transfer failed for milestone release {$milestone->id}", [
+                'error' => $e->getMessage(),
             ]);
+            return response()->json([
+                'error'  => 'Stripe transfer failed. No funds moved.',
+                'detail' => $e->getMessage(),
+            ], 502);
+        }
 
-            // 4. Update escrow balance
-            $escrow = $contract->escrowBalance;
-            if ($escrow) {
-                $escrow->increment('released_amount', $milestone->amount);
-            }
-        });
+        try {
+            DB::transaction(function () use ($milestone, $contract, $transfer) {
+                $milestone->update(['status' => 'released']);
+
+                Transaction::create([
+                    'contract_id'        => $contract->id,
+                    'milestone_id'       => $milestone->id,
+                    'initiated_by'       => $contract->client_id,
+                    'type'               => 'release',
+                    'amount'             => $milestone->amount,
+                    'currency'           => $contract->currency,
+                    'stripe_transfer_id' => $transfer->id,
+                    'status'             => 'pending', // promoted to completed via webhook
+                ]);
+
+                $escrow = $contract->escrowBalance;
+                if ($escrow) {
+                    $escrow->increment('released_amount', $milestone->amount);
+                }
+            });
+        } catch (\Throwable $e) {
+            Log::critical('Stripe transfer succeeded but DB write failed — manual reconciliation required.', [
+                'milestone_id' => $milestone->id,
+                'transfer_id'  => $transfer->id,
+                'error'        => $e->getMessage(),
+            ]);
+            return response()->json([
+                'error'       => 'Transfer issued but database not updated. Contact support immediately.',
+                'transfer_id' => $transfer->id,
+            ], 500);
+        }
 
         return response()->json([
             'message'   => 'Funds released to freelancer.',
@@ -275,6 +344,8 @@ class PaymentController extends Controller
             'payment_intent.succeeded'  => $this->handlePaymentIntentSucceeded($event->data->object),
             'transfer.created'          => $this->handleTransferCreated($event->data->object),
             'charge.dispute.created'    => $this->handleChargeDisputeCreated($event->data->object),
+            'charge.refunded'           => $this->handleChargeRefunded($event->data->object),
+            'account.updated'           => $this->handleAccountUpdated($event->data->object),
             default                     => null, // ignore unhandled event types
         };
 
@@ -300,6 +371,22 @@ class PaymentController extends Controller
         Log::info("Transfer {$transfer->id} confirmed — release marked completed.");
     }
 
+    private function handleChargeRefunded(\Stripe\Charge $charge): void
+    {
+        // A charge.refunded event fires when a refund is confirmed by Stripe.
+        // Match the refund back to our Transaction via the refund ID in the charge's refunds list.
+        foreach ($charge->refunds->data as $refund) {
+            $updated = Transaction::where('stripe_reference', $refund->id)
+                ->where('type', 'refund')
+                ->where('status', 'pending')
+                ->update(['status' => 'completed']);
+
+            if ($updated) {
+                Log::info("Refund {$refund->id} confirmed via webhook — transaction marked completed.");
+            }
+        }
+    }
+
     private function handleChargeDisputeCreated(\Stripe\Dispute $dispute): void
     {
         // A chargeback was filed against a payment — flag the related transaction
@@ -313,6 +400,31 @@ class PaymentController extends Controller
         Log::warning("Stripe chargeback created: {$dispute->id}", [
             'payment_intent' => $paymentIntentId,
             'reason'         => $dispute->reason,
+        ]);
+    }
+
+    /**
+     * account.updated — Stripe notifies us when a connected account's capabilities change.
+     * Keeps PaymentAccount in sync without requiring the freelancer to hit /connect/return again.
+     */
+    private function handleAccountUpdated(\Stripe\Account $account): void
+    {
+        $paymentAccount = PaymentAccount::where('stripe_account_id', $account->id)->first();
+
+        if (! $paymentAccount) {
+            return; // Unknown account — ignore
+        }
+
+        $paymentAccount->update([
+            'status'          => $account->charges_enabled ? 'active' : 'restricted',
+            'payout_enabled'  => $account->payouts_enabled,
+            'charges_enabled' => $account->charges_enabled,
+            'capabilities'    => $account->capabilities->toArray(),
+        ]);
+
+        Log::info("Connected account {$account->id} updated via webhook.", [
+            'charges_enabled' => $account->charges_enabled,
+            'payouts_enabled' => $account->payouts_enabled,
         ]);
     }
 }

@@ -53,6 +53,8 @@ Route::prefix('v1')->group(function () {
         Route::get('/disputes/{dispute}',              [DisputeController::class, 'show']);
         Route::post('/disputes/{dispute}/evidence',    [DisputeController::class, 'submitEvidence']);
         Route::patch('/disputes/{dispute}/resolve',    [DisputeController::class, 'resolve']);
+        Route::post('/disputes/{dispute}/execute-resolution', [DisputeController::class, 'executeResolution']);
+        Route::post('/disputes/{dispute}/reconcile-claiming', [DisputeController::class, 'reconcileClaiming']);
         Route::post('/disputes/{dispute}/ai-summary',  [AiDisputeController::class, 'generateSummary']);
         Route::post('/disputes/{dispute}/ai-suggest',  [AiDisputeController::class, 'generateSuggestion']);
 
@@ -71,6 +73,7 @@ Route::prefix('v1')->group(function () {
         // Stripe Connect onboarding
         Route::post('/connect/onboard',  [PaymentController::class, 'onboard']);
         Route::get('/connect/return',    [PaymentController::class, 'connectReturn']);
+        Route::get('/connect/refresh',   [PaymentController::class, 'connectRefresh']); // re-generates onboarding link
 
         // Pusher channel authentication
         Broadcast::routes(['middleware' => ['auth:sanctum']]);
