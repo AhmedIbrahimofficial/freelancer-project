@@ -18,14 +18,26 @@ jobs:
       uses: shivammathur/setup-php@v2
       with:
         php-version: '8.3'
-        extensions: mbstring, bcmath, sqlite3, pdo_sqlite
+        extensions: mbstring, bcmath, sqlite3, pdo_sqlite, dom, curl, json, zip, gd, exif, fileinfo
+        ini-values: post_max_size=256M, max_execution_time=180
         coverage: none
 
-    - name: Copy .env
-      run: php -r "file_exists('.env') || copy('.env.example', '.env');"
+    - name: Get composer cache directory
+      id: composer-cache
+      run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+    - name: Cache composer dependencies
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+        restore-keys: ${{ runner.os }}-composer-
 
     - name: Install Dependencies
-      run: composer install -q --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+      run: composer install --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+
+    - name: Copy .env
+      run: cp .env.example .env
 
     - name: Generate key
       run: php artisan key:generate
@@ -51,4 +63,5 @@ jobs:
         STRIPE_KEY: ""
         STRIPE_SECRET: ""
         STRIPE_WEBHOOK_SECRET: ""
+        APP_ENV: testing
       run: php artisan test --no-ansi
