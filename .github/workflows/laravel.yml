@@ -34,7 +34,12 @@ jobs:
         restore-keys: ${{ runner.os }}-composer-
 
     - name: Install Dependencies
-      run: composer install --no-ansi --no-interaction --no-scripts --no-progress --prefer-dist
+      run: composer install --no-ansi --no-interaction --no-progress --prefer-dist --no-scripts
+
+    - name: Run autoload and package discovery
+      run: |
+        composer dump-autoload --no-scripts
+        php artisan package:discover --ansi || true
 
     - name: Copy .env
       run: cp .env.example .env
