@@ -8,65 +8,64 @@ on:
 
 jobs:
   laravel-tests:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup PHP 8.3
-      uses: shivammathur/setup-php@v2
-      with:
-        php-version: '8.3'
-        extensions: mbstring, bcmath, sqlite3, pdo_sqlite, dom, curl, json, zip, gd, exif, fileinfo
-        ini-values: post_max_size=256M, max_execution_time=180
-        coverage: none
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, bcmath, pdo, pdo_sqlite, sqlite3, dom, curl, json, zip, gd, exif, fileinfo, intl
+          ini-values: post_max_size=256M, max_execution_time=300
+          coverage: none
 
-    - name: Get composer cache directory
-      id: composer-cache
-      run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+      - name: Validate composer.json
+        run: composer validate --no-check-publish
 
-    - name: Cache composer dependencies
-      uses: actions/cache@v4
-      with:
-        path: ${{ steps.composer-cache.outputs.dir }}
-        key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
-        restore-keys: ${{ runner.os }}-composer-
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
 
-    - name: Install Dependencies
-      run: composer install --no-ansi --no-interaction --no-progress --prefer-dist --no-scripts
+      - name: Cache Composer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-php8.3-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-php8.3-composer-
 
-    - name: Run autoload and package discovery
-      run: |
-        composer dump-autoload --no-scripts
-        php artisan package:discover --ansi || true
+      - name: Install Composer dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
 
-    - name: Copy .env
-      run: cp .env.example .env
+      - name: Prepare Laravel application
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          chmod -R 777 storage bootstrap/cache
 
-    - name: Generate key
-      run: php artisan key:generate
+      - name: Create SQLite database
+        run: |
+          mkdir -p database
+          touch database/database.sqlite
 
-    - name: Directory Permissions
-      run: chmod -R 777 storage bootstrap/cache
+      - name: Run database migrations
+        env:
+          DB_CONNECTION: sqlite
+          DB_DATABASE: database/database.sqlite
+        run: php artisan migrate --force
 
-    - name: Create Database
-      run: |
-        mkdir -p database
-        touch database/database.sqlite
-
-    - name: Run Migrations
-      env:
-        DB_CONNECTION: sqlite
-        DB_DATABASE: database/database.sqlite
-      run: php artisan migrate --force
-
-    - name: Execute tests
-      env:
-        DB_CONNECTION: sqlite
-        DB_DATABASE: database/database.sqlite
-        STRIPE_KEY: ""
-        STRIPE_SECRET: ""
-        STRIPE_WEBHOOK_SECRET: ""
-        APP_ENV: testing
-      run: php artisan test --no-ansi
+      - name: Run test suite
+        env:
+          DB_CONNECTION: sqlite
+          DB_DATABASE: database/database.sqlite
+          APP_ENV: testing
+          APP_KEY: base64:test
+          STRIPE_KEY: ""
+          STRIPE_SECRET: ""
+          STRIPE_WEBHOOK_SECRET: ""
+          QUEUE_CONNECTION: sync
+          MAIL_MAILER: array
+          BROADCAST_CONNECTION: log
+        run: php artisan test --no-ansi
