@@ -1,235 +1,360 @@
-# Freelancer Payment Protection Platform
+# FreelancerProtect — Escrow & Contract Platform
 
-An escrow and dispute-resolution platform for freelancers and clients working directly (outside marketplaces like Upwork/Fiverr). Freelancers working cross-border, direct-contract deals have no neutral way to secure payment or resolve disputes fairly — this platform fixes that with binding milestone contracts, transparent dispute mediation, and secure escrow payments.
-
----
-
-## Table of Contents
-- [What This Does](#what-this-does)
-- [How It Works](#how-it-works)
-- [Tech Stack](#tech-stack)
-- [Features by Phase](#features-by-phase)
-- [What's Working](#whats-working)
-- [What's NOT Working / TODO](#whats-not-working--todo)
-- [Local Setup](#local-setup)
-- [Environment Variables](#environment-variables)
-- [Testing](#testing)
-- [API Overview](#api-overview)
-- [Database Schema](#database-schema)
+A Laravel-based platform that protects both clients and freelancers through milestone-based escrow payments, digital contract signing, and AI-assisted dispute resolution.
 
 ---
 
-## What This Does
+## Architecture — Payment Flow
 
-Two people — a client and a freelancer — who've never worked together and are based in different countries can:
-1. Create a binding milestone-based contract, digitally signed by both parties
-2. Fund the contract through escrow (money held securely, not paid directly)
-3. Have the freelancer submit work per milestone, and the client approve or dispute it
-4. If disputed, submit evidence and reach a fair resolution — with an optional AI-generated neutral summary
-5. Release payment automatically once milestones are approved
-6. Build a public reputation profile based on completed contracts
+```
+CLIENT
+  │
+  ├─ POST /contracts/{id}/fund
+  │    └─ Stripe PaymentIntent (capture_method: manual)
+  │         └─ Funds held in Stripe — NOT released yet
+  │
+  │  [Freelancer submits milestone]
+  │  [Client approves milestone]
+  │
+  ├─ POST /milestones/{id}/release  ← explicit action required
+  │    └─ Stripe Transfer → FREELANCER'S CONNECTED ACCOUNT
+  │         └─ Freelancer triggers payout to their bank
+  │
+  └─ If dispute:
+       Client / Freelancer → submit evidence
+       Admin/Mediator reviews
+       │
+       ├─ Decision: Release → explicit POST /milestones/{id}/release
+       └─ Decision: Refund  → explicit Stripe refund action
+```
 
-The core idea: neither party has to "just trust" the other. The platform is the neutral third party holding both the money and the record.
-
----
-
-## How It Works — Step by Step
-
-**1. Contract creation**
-A client (or freelancer) creates a contract: scope of work, one or more milestones each with an amount and due date. Both parties must digitally sign (typed full name + timestamp + IP address recorded) before the contract becomes active — this creates a legally meaningful, tamper-evident record.
-
-**2. Funding escrow**
-Once signed, the client funds the contract via Stripe Connect. The money is held by Stripe (not by the platform directly) — the platform only tracks status (held/released/refunded), it never custodies funds itself. This keeps the platform out of money-transmitter licensing territory.
-
-**3. Milestone work**
-The freelancer submits completed work against a milestone. The client reviews and either:
-- **Approves** → triggers an automatic Stripe transfer releasing that milestone's funds to the freelancer
-- **Disputes** → the milestone is locked, and both parties enter the dispute flow
-
-**4. Dispute resolution**
-Either party can submit evidence (text explanation + files) to a shared, append-only evidence thread. An AI-generated neutral summary and non-binding suggested resolution can be requested (clearly labeled as AI, never auto-applied). A human mediator/admin makes the final call, which updates the milestone and releases or refunds funds accordingly.
-
-**5. Reputation**
-After each contract, both parties' completion rate, dispute rate, and on-time rate update automatically, visible on their public profile — so future counterparties can see a track record before agreeing to work together.
-
-**6. Real-time updates**
-Every status change (signature, milestone approval, dispute raised, funds released) broadcasts live to both parties via Pusher — no manual refreshing needed.
+**Your platform is the orchestrator, not the payment recipient.**
+Every freelancer has their own Stripe Express Connected Account.
+You never touch the money directly.
 
 ---
 
-## Tech Stack
+## Dispute Resolution — Safety Boundary
 
-**Backend:** PHP (Laravel) + MySQL
-**Frontend:** React + TypeScript + Tailwind CSS + TanStack Query
-**Payments/Escrow:** Stripe Connect (Express accounts)
-**Real-time:** Pusher (WebSocket broadcasting)
-**Email:** Mailgun/Postmark (via Laravel Mail)
-**AI dispute assistance:** Anthropic Claude API
-**Auth:** Laravel Sanctum (API token auth)
-**Testing:** Pest/PHPUnit
+> **Critical:** `dispute resolved` ≠ `money automatically released`
 
-**Key Laravel packages:**
-| Package | Purpose |
-|---|---|
-| `laravel/sanctum` | API token authentication |
-| `spatie/laravel-permission` | Role management (freelancer/client/admin) |
-| `spatie/laravel-activitylog` | Full audit trail on all binding actions |
-| `spatie/laravel-medialibrary` | Evidence file / document uploads (S3-backed) |
-| `barryvdh/laravel-dompdf` | Signed contract PDF generation |
-| `pusher/pusher-php-server` | Real-time broadcasting |
+This is an intentional safety boundary. Funds never move automatically after a dispute is resolved. Every money movement requires an explicit action.
 
----
+```
+DISPUTE RAISED
+  │
+  ├─ Milestone locked (status: disputed)
+  ├─ Approve blocked (422)
+  ├─ Release blocked (422)
+  └─ Funds remain held in Stripe escrow
+       │
+       │  [Both parties submit evidence]
+       │  [Admin/Mediator reviews]
+       │
+       ▼
+  PATCH /disputes/{id}/resolve
+       │
+       ├─ resolved_freelancer
+       │    └─ execute-resolution → Stripe Transfer 100% → Freelancer
+       │
+       ├─ resolved_client
+       │    └─ execute-resolution → Stripe Refund 100% → Client
+       │
+       ├─ resolved_split  (requires freelancer_percent: 1–99)
+       │    └─ execute-resolution
+       │         ├─ Leg 1: Stripe Transfer → Freelancer (floor of percent)
+       │         └─ Leg 2: Stripe Refund  → Client (remainder, no cent lost)
+       │              │
+       │              └─ If Leg 2 fails after Leg 1 succeeded:
+       │                   split_state = partial_failure
+       │                   Re-call execute-resolution to retry refund leg only
+       │
+       └─ closed
+            └─ execute-resolution → no financial movement
+```
 
-## Features by Phase
+This means: if an admin forgets to act after resolving, the money stays safe in escrow. Nothing is lost, nothing is leaked. The worst outcome is a delay, not a loss.
 
-**Phase 1 — Contracts & Dispute Mediation**
-Milestone contract creation, digital signing, milestone submit/approve/dispute, evidence submission, admin-mediated resolution. No money movement yet.
+**Split resolution rules:**
+- `freelancer_percent` range: 1–99 (integers or decimals, e.g. 66.67)
+- 0% = full refund → use `resolved_client` instead
+- 100% = full transfer → use `resolved_freelancer` instead
+- Rounding: freelancer gets `floor(total × percent/100)`, client gets the remainder — no cent is lost or created
+- Both legs use idempotency keys — safe to retry on network failure
+- If transfer succeeds but refund fails: `split_state = partial_failure`, re-call `execute-resolution` to retry refund leg only (transfer is NOT re-executed)
+- Both legs recorded as separate Transactions (`release` + `refund`) for full audit trail
 
-**Phase 2 — Reputation & Verification**
-Verified badges (email/ID), public reputation stats (completion rate, dispute rate, on-time rate), computed via a queued job after each contract completes.
-
-**Phase 3 — Escrow & Payments**
-Stripe Connect integration: fund escrow, automatic milestone-triggered release, freelancer payouts, full transaction ledger, webhook-driven state (never trusts client-side confirmation).
-
-**Phase 4 — AI Dispute Assistant**
-Claude-generated neutral evidence summaries and non-binding suggested resolutions, clearly labeled as AI-generated and never auto-applied to a dispute outcome.
-
----
-
-## What's Working
-
-- ✅ Full contract lifecycle: creation → signing → milestone submit/approve → completion
-- ✅ Dispute flow: raise → evidence submission → admin resolution
-- ✅ 70 passing automated tests covering contract signing, milestone flow, disputes, authorization, and activity logging
-- ✅ Frontend fully wired to the real backend API (no more mock data) — typed API client, Sanctum token auth, TanStack Query for data fetching, real loading/error states
-- ✅ 6 transactional email types live (signature request, contract signed, milestone submitted/approved, dispute raised/resolved)
-- ✅ Real-time updates via Pusher on private per-contract channels — both parties see live status changes without refreshing
-- ✅ Stripe Connect escrow flow working end-to-end **in test mode**: fund contract → approve milestone → automatic transfer → freelancer withdrawal, with idempotency keys and webhook-driven state updates
-- ✅ Full audit trail via activity log on every signature, approval, and dispute action
-
-## What's NOT Working / TODO
-
-- ⚠️ **Stripe is in TEST MODE ONLY** — live keys (`STRIPE_KEY`, `STRIPE_SECRET`, `STRIPE_WEBHOOK_SECRET`) are not yet configured; no real money can move until these are set and the full flow is re-verified in production
-- ⚠️ **No legal review yet** — Terms of Service defining the platform as a facilitator (not a bank/escrow license holder) needs a real lawyer's review before accepting real transactions
-- ⚠️ **AI dispute summaries (Phase 4)** are wired to the Anthropic API but should be spot-checked for output quality/appropriateness before relying on them in live disputes
-- ⚠️ **No production deployment yet** — currently runs locally only; needs a real server, production Redis/queue worker setup, and a real domain for Stripe webhooks to reach
-- ⚠️ **No rate limiting audit done** — throttle middleware is in place on auth/payment routes by default Laravel config, but hasn't been stress-tested
-- ⚠️ **No monitoring/alerting configured** — Laravel Horizon is installed for queue monitoring but no external uptime/error alerting (e.g., Sentry) is set up yet
+**What is NOT implemented yet:**
+`resolved_split` now fully implements partial resolution. The remaining gap is split percentage validation at the business policy level — currently any value 1–99 is accepted. If you want to enforce specific increments (e.g. only multiples of 5%, or minimum 10%) add that validation to the `resolve` request before production.
 
 ---
 
 ## Local Setup
 
 ```bash
-composer create-project laravel/laravel freelancer-protect
-cd freelancer-protect
-composer install
 cp .env.example .env
+composer install
 php artisan key:generate
-```
-
-Configure `.env` with your local MySQL database, then:
-```bash
 php artisan migrate
-php artisan db:seed
 php artisan serve
 ```
 
-For queues (required for emails, AI dispute summaries, and Stripe webhook processing):
+For real-time features (disputes, notifications):
 ```bash
 php artisan queue:work
 ```
 
-For real-time events, configure Pusher credentials in `.env`, then on the frontend the Echo client will connect automatically on login.
+---
 
-For Stripe webhook testing locally, use the Stripe CLI:
+## Stripe Setup
+
+### Test Mode (development)
+
+```env
+STRIPE_KEY=pk_test_...
+STRIPE_SECRET=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+```
+
+Install the [Stripe CLI](https://stripe.com/docs/stripe-cli) then run:
 ```bash
 stripe listen --forward-to localhost:8000/api/v1/webhooks/stripe
 ```
 
----
+### Live Mode (production)
 
-## Environment Variables
-
-Key variables required in `.env`:
-
-```
-DB_CONNECTION=mysql
-DB_HOST=127.0.0.1
-DB_DATABASE=freelancer_protect
-DB_USERNAME=root
-DB_PASSWORD=
-
-STRIPE_KEY=pk_test_...
-STRIPE_SECRET=sk_test_...
+```env
+STRIPE_KEY=pk_live_...
+STRIPE_SECRET=sk_live_...
 STRIPE_WEBHOOK_SECRET=whsec_...
-
-PUSHER_APP_ID=
-PUSHER_APP_KEY=
-PUSHER_APP_SECRET=
-
-MAIL_MAILER=mailgun (or postmark)
-MAILGUN_DOMAIN=
-MAILGUN_SECRET=
-
-ANTHROPIC_API_KEY=
+STRIPE_PLATFORM_FEE_PERCENT=5    # optional: 5% platform cut. Default 0.
 ```
+
+**Webhook endpoint** — register in Stripe Dashboard → Webhooks:
+```
+https://yourdomain.com/api/v1/webhooks/stripe
+```
+
+Required events:
+- `payment_intent.succeeded`
+- `transfer.created`
+- `charge.dispute.created`
+- `account.updated`
 
 ---
 
-## Testing
+## Freelancer Onboarding Flow
+
+Every freelancer must connect a Stripe account before funds can be released to them.
+
+```
+1. POST /api/v1/connect/onboard   → returns { onboarding_url }
+2. Redirect freelancer to onboarding_url (Stripe-hosted KYC)
+3. Stripe redirects back to GET /api/v1/connect/return
+4. PaymentAccount.status → "active", payout_enabled → true
+```
+
+If the onboarding link expires:
+```
+GET /api/v1/connect/refresh   → returns a fresh onboarding_url
+```
+
+The `account.updated` webhook keeps `PaymentAccount` in sync automatically.
+
+---
+
+## Pre-Production Test Gate
+
+**12 automated checks must pass before touching live keys.**
+This is a gate, not a suggestion.
+
+```
+CODE
+  │
+  ▼
+php artisan stripe:test-escrow-flow   (12 automated checks)
+  │
+  ├─ FAIL → fix, re-run
+  │
+  └─ PASS
+       │
+       ▼
+  Manual Stripe Dashboard verification
+  (payments / connect accounts / transfers / webhooks)
+       │
+       ▼
+  2 separate test users — full scenario manually
+       │
+       ├─ Normal payment → milestone → release
+       ├─ Dispute → evidence → admin resolves → manual release/refund
+       ├─ Declined card → verify escrow NOT funded
+       ├─ Duplicate request → verify same PaymentIntent returned
+       └─ Webhook delivery → verify events in Stripe Dashboard
+       │
+       ├─ ANY FAIL → fix
+       │
+       └─ ALL PASS
+            │
+            ▼
+       Production infrastructure
+       (PostgreSQL, queue workers, HTTPS, mail provider)
+            │
+            ▼
+       Legal + monitoring + rate limits
+       (ToS, Privacy Policy, Sentry, Supervisor)
+            │
+            ▼
+       Live Stripe keys
+            │
+            ▼
+       REAL USERS
+```
+
+### Running the automated checks
 
 ```bash
-php artisan test
+# Terminal 1 — app server
+php artisan serve
+
+# Terminal 2 — queue worker
+php artisan queue:work
+
+# Terminal 3 — webhook forwarding
+stripe listen --forward-to localhost:8000/api/v1/webhooks/stripe
+
+# Terminal 4 — run all 12 checks
+php artisan stripe:test-escrow-flow
 ```
 
-70 tests currently passing across:
-- `ContractSigningTest` — signature requirements, dual-signing, edit-lock after signing
-- `MilestoneFlowTest` — submit/approve authorization, event dispatch, double-approval prevention
-- `DisputeFlowTest` — dispute locking, evidence append-only rules, admin-only resolution
-- `AuthorizationTest` — non-party access blocked, role-based permissions
-- `ActivityLogTest` — every binding action produces an audit log entry
+### What the 12 checks cover
+
+| Step | What is tested |
+|------|----------------|
+| 1 | Demo accounts created |
+| 2 | Freelancer Stripe Express account created |
+| 3 | Contract + milestone created |
+| 4 | PaymentIntent created → escrow funded |
+| 5 | Milestone submitted |
+| 6 | Milestone approved → Stripe transfer to freelancer |
+| 7 | Transaction ledger: deposit → release sequence |
+| 8 | Dispute raised → funds held, approve blocked |
+| 9 | Admin resolves → release blocked after resolution, execute-resolution, idempotency, admin-only guard |
+| 9b | Split resolution 70/30 → splitAmounts math, execution, idempotency, transactions, escrow accounting |
+| 10 | Declined card → CardException, escrow NOT funded |
+| 11 | Duplicate fund request → same PaymentIntent (idempotency) |
+| 12 | Invalid webhook signature → rejected (400) |
+
+### After automated checks — manual Stripe Dashboard verification
+
+- `dashboard.stripe.com/test/payments` — payment exists with correct amount
+- `dashboard.stripe.com/test/connect/accounts` — Express account exists and active
+- `dashboard.stripe.com/test/transfers` — transfer to freelancer's account exists
+- `dashboard.stripe.com/test/webhooks` — all 4 event types received and delivered
+
+### Edge cases — manual test cards
+
+| Scenario | Test value | Expected behaviour |
+|----------|-----------|-------------------|
+| Card declined | `pm_card_chargeDeclined` | CardException, escrow stays unfunded |
+| Insufficient funds | `pm_card_visa_chargeDeclinedInsufficientFunds` | CardException |
+| 3D Secure required | `pm_card_threeDSecure2Required` | `requires_action` status |
+| Fraudulent | `pm_card_visa_chargeDeclinedFraudulent` | CardException |
+
+Full list: [stripe.com/docs/testing](https://stripe.com/docs/testing)
 
 ---
 
-## API Overview
+## Production Checklist
 
-All endpoints under `/api/v1/`, Sanctum token auth required except registration/login.
+12 tests passing = **software readiness**. It is not the same as **production readiness**.
 
-```
-POST   /contracts                    Create contract (draft)
-GET    /contracts/{id}               Contract detail + timeline
-POST   /contracts/{id}/send          Send to counterparty
-POST   /contracts/{id}/sign          Sign (records signature)
+### Infrastructure
+- [ ] PostgreSQL or MySQL (not SQLite)
+- [ ] `APP_ENV=production`, `APP_DEBUG=false`
+- [ ] HTTPS only — valid TLS certificate
+- [ ] Queue workers via Supervisor or Laravel Horizon
+- [ ] Real mail provider (Mailgun / Postmark / SES)
+- [ ] Pusher (or Soketi) for real-time notifications
 
-POST   /milestones/{id}/submit       Freelancer submits work
-POST   /milestones/{id}/approve      Client approves → triggers fund release
-POST   /milestones/{id}/dispute      Raise dispute
+### Stripe
+- [ ] Live keys: `pk_live_` / `sk_live_`
+- [ ] Webhook registered with correct production URL and all 5 events (`payment_intent.succeeded`, `transfer.created`, `charge.dispute.created`, `charge.refunded`, `account.updated`)
+- [ ] Stripe platform application approved (required for Connect)
+- [ ] Verify Stripe Connect availability for your country: [stripe.com/global](https://stripe.com/global)
+- [ ] `STRIPE_PLATFORM_FEE_PERCENT` set intentionally (0 = no fee)
+- [ ] Decide if split percentage increments need restricting (e.g. multiples of 5%) — add validation to `resolve` if so
 
-POST   /disputes/{id}/evidence       Submit evidence
-PATCH  /disputes/{id}/resolve        Admin/mediator resolves
+### Legal
+- [ ] Terms of Service
+- [ ] Privacy Policy
+- [ ] Dispute and Refund Policy (users must know the process)
+- [ ] Legal review for jurisdiction-specific requirements
 
-POST   /contracts/{id}/fund          Fund escrow (Stripe PaymentIntent)
-POST   /milestones/{id}/release      Release held funds (usually automatic on approval)
-POST   /webhooks/stripe              Stripe webhook handler
-GET    /transactions                 Transaction ledger
-POST   /payouts/withdraw             Freelancer withdrawal
+### Security
+- [ ] Rate limiting on all payment endpoints
+- [ ] CORS policy configured
+- [ ] CSP headers
 
-GET    /users/{id}/profile           Public profile + reputation stats
-GET    /dashboard                    Contract list w/ filters
-```
+### Monitoring
+- [ ] Error tracking (Sentry / Bugsnag)
+- [ ] Uptime monitoring
+- [ ] Failed job alerts (queue failures = stuck money)
+- [ ] AI dispute suggestions reviewed manually before user-facing use
 
 ---
 
-## Database Schema (15 tables)
+## API Reference
 
-`users`, `contracts`, `milestones`, `contract_signatures`, `disputes`, `dispute_evidence`, `verifications`, `reputation_stats`, `payment_accounts`, `escrow_balances`, `transactions`, `ai_dispute_summaries`, plus Spatie's permission/role tables and the activity log table.
+### Auth
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/register` | Register (`role: client\|freelancer`) |
+| POST | `/api/v1/login` | Login → Sanctum token |
+| POST | `/api/v1/logout` | Logout |
+| GET  | `/api/v1/me` | Current user |
+
+### Contracts
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/contracts` | Create contract |
+| GET  | `/api/v1/contracts/{id}` | Get contract |
+| POST | `/api/v1/contracts/{id}/send` | Send to freelancer |
+| POST | `/api/v1/contracts/{id}/sign` | Sign contract |
+| POST | `/api/v1/contracts/{id}/fund` | Fund escrow (client) |
+
+### Milestones
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/milestones/{id}/submit` | Submit work (freelancer) |
+| POST | `/api/v1/milestones/{id}/approve` | Approve work (client) |
+| POST | `/api/v1/milestones/{id}/release` | Release funds to freelancer (client) |
+| POST | `/api/v1/milestones/{id}/dispute` | Raise dispute |
+
+### Disputes
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET   | `/api/v1/disputes/{id}` | View dispute + evidence thread |
+| POST  | `/api/v1/disputes/{id}/evidence` | Submit evidence (file or message) |
+| PATCH | `/api/v1/disputes/{id}/resolve` | Set resolution decision (admin only) |
+| POST  | `/api/v1/disputes/{id}/execute-resolution` | Execute Stripe financial action (admin only) |
+| POST  | `/api/v1/disputes/{id}/ai-summary` | AI-generated summary |
+| POST  | `/api/v1/disputes/{id}/ai-suggest` | AI resolution suggestion (advisory) |
+
+### Payments & Stripe Connect
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/connect/onboard` | Start Stripe Connect onboarding |
+| GET  | `/api/v1/connect/return` | Stripe redirects here after onboarding |
+| GET  | `/api/v1/connect/refresh` | Re-generate expired onboarding link |
+| GET  | `/api/v1/transactions` | Transaction ledger |
+| POST | `/api/v1/payouts/withdraw` | Freelancer withdraws to bank |
+| POST | `/api/v1/webhooks/stripe` | Stripe webhook receiver (no auth) |
 
 ---
 
-## Security Notes
+## What This Platform Does NOT Do
 
-- All payment state changes are driven by verified Stripe webhooks — the frontend/client is never trusted to confirm a payment succeeded
-- Fund-release logic is wrapped in database transactions to prevent partial-failure states
-- Idempotency keys used on all Stripe mutation calls to prevent double-charge/double-release on retry
-- Full activity log audit trail on every signature, approval, and dispute action
+- **Does not hold funds in a platform bank account.** Money flows through Stripe directly to freelancer connected accounts.
+- **Does not auto-release funds after dispute resolution.** Every money movement after a dispute is an explicit manual action.
+- **Does not replace legal agreements.** The digital contract is a record. Consult a lawyer for jurisdiction-specific requirements.
+- **Does not make final dispute decisions automatically.** AI suggestions are advisory only. A human admin resolves disputes.

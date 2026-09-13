@@ -5,11 +5,13 @@ namespace App\Providers;
 use App\Events\ContractSigned;
 use App\Events\DisputeRaised;
 use App\Events\DisputeResolved;
+use App\Events\DisputeResolutionExecuted;
 use App\Events\MilestoneApproved;
 use App\Events\MilestoneSubmitted;
 use App\Listeners\NotifyContractSigned;
 use App\Listeners\NotifyDisputeRaised;
 use App\Listeners\NotifyDisputeResolved;
+use App\Listeners\NotifyDisputeResolutionExecuted;
 use App\Listeners\NotifyMilestoneApproved;
 use App\Listeners\NotifyMilestoneSubmitted;
 use App\Listeners\TriggerReputationRecompute;
@@ -28,11 +30,12 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         // ── Event → Listener bindings ────────────────────────────────
-        Event::listen(ContractSigned::class,    NotifyContractSigned::class);
-        Event::listen(MilestoneSubmitted::class, NotifyMilestoneSubmitted::class);
-        Event::listen(MilestoneApproved::class,  NotifyMilestoneApproved::class);
-        Event::listen(DisputeRaised::class,      NotifyDisputeRaised::class);
-        Event::listen(DisputeResolved::class,    NotifyDisputeResolved::class);
-        Event::listen(DisputeResolved::class,    TriggerReputationRecompute::class);
+        Event::listen(ContractSigned::class,              NotifyContractSigned::class);
+        Event::listen(MilestoneSubmitted::class,           NotifyMilestoneSubmitted::class);
+        Event::listen(MilestoneApproved::class,            NotifyMilestoneApproved::class);
+        Event::listen(DisputeRaised::class,                NotifyDisputeRaised::class);
+        Event::listen(DisputeResolved::class,              NotifyDisputeResolved::class);
+        Event::listen(DisputeResolved::class,              TriggerReputationRecompute::class);
+        Event::listen(DisputeResolutionExecuted::class,    NotifyDisputeResolutionExecuted::class);
     }
 }

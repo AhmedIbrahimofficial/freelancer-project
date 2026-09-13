@@ -33,11 +33,22 @@ return [
     |--------------------------------------------------------------------------
     | Stripe
     |--------------------------------------------------------------------------
+    |
+    | STRIPE_KEY        — publishable key (pk_live_... or pk_test_...)
+    | STRIPE_SECRET     — secret key (sk_live_... or sk_test_...)
+    | STRIPE_WEBHOOK_SECRET — from `stripe listen` or the Stripe dashboard webhook
+    |
+    | STRIPE_PLATFORM_FEE_PERCENT — optional platform cut, e.g. 5 = 5%.
+    |   Applied as application_fee_amount on the PaymentIntent when a freelancer
+    |   has already connected their account at funding time.
+    |   Set to 0 to disable platform fees.
+    |
     */
     'stripe' => [
-        'key'             => env('STRIPE_KEY'),
-        'secret'          => env('STRIPE_SECRET'),
-        'webhook_secret'  => env('STRIPE_WEBHOOK_SECRET'),
+        'key'                  => env('STRIPE_KEY'),
+        'secret'               => env('STRIPE_SECRET'),
+        'webhook_secret'       => env('STRIPE_WEBHOOK_SECRET'),
+        'platform_fee_percent' => env('STRIPE_PLATFORM_FEE_PERCENT', 0),
     ],
 
     /*

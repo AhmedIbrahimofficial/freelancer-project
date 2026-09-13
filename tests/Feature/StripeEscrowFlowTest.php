@@ -129,9 +129,18 @@ class StripeEscrowFlowTest extends TestCase
     public function test_client_can_fund_escrow(): void
     {
         $stripe = $this->mockStripe();
+        // createPaymentIntent now accepts optional 5th (destination account) and 6th (fee) args.
+        // The freelancer has a connected account in setUp, so the controller passes it.
         $stripe->shouldReceive('createPaymentIntent')
             ->once()
-            ->with(150000, 'USD', $this->contract->id, "fund-{$this->contract->id}")
+            ->with(
+                150000,
+                'USD',
+                $this->contract->id,
+                "fund-{$this->contract->id}",
+                'acct_test_freelancer', // destination account
+                0,                      // fee cents (STRIPE_PLATFORM_FEE_PERCENT defaults to 0)
+            )
             ->andReturn($this->fakePaymentIntent('pi_fund_001'));
 
         $response = $this->actingAs($this->client)
@@ -259,12 +268,12 @@ class StripeEscrowFlowTest extends TestCase
             'status' => 'released',
         ]);
 
-        // Release transaction recorded
+        // Release transaction recorded — status is 'pending', webhook promotes to 'completed'
         $this->assertDatabaseHas('transactions', [
             'contract_id'        => $this->contract->id,
             'milestone_id'       => $this->milestone->id,
             'type'               => 'release',
-            'status'             => 'completed',
+            'status'             => 'pending',
             'stripe_transfer_id' => 'tr_release_001',
         ]);
     }
