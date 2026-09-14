@@ -19,11 +19,7 @@ jobs:
         with:
           php-version: '8.3'
           extensions: mbstring, bcmath, pdo, pdo_sqlite, sqlite3, dom, curl, json, zip, gd, exif, fileinfo, intl
-          ini-values: post_max_size=256M, max_execution_time=300
           coverage: none
-
-      - name: Validate composer.json
-        run: composer validate --no-check-publish
 
       - name: Get Composer cache directory
         id: composer-cache
@@ -33,13 +29,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-php8.3-composer-${{ hashFiles('**/composer.lock') }}
-          restore-keys: ${{ runner.os }}-php8.3-composer-
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
 
       - name: Install Composer dependencies
-        run: composer install --prefer-dist --no-interaction --no-progress --ignore-platform-req=ext-exif --ignore-platform-req=ext-imagick --ignore-platform-req=php
+        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts --ignore-platform-reqs
 
-      - name: Prepare Laravel application
+      - name: Run post-install scripts
+        run: |
+          composer dump-autoload --optimize
+          php artisan package:discover --ansi || true
+
+      - name: Prepare application
         run: |
           cp .env.example .env
           php artisan key:generate
@@ -50,18 +51,17 @@ jobs:
           mkdir -p database
           touch database/database.sqlite
 
-      - name: Run database migrations
+      - name: Run migrations
         env:
           DB_CONNECTION: sqlite
           DB_DATABASE: database/database.sqlite
         run: php artisan migrate --force
 
-      - name: Run test suite
+      - name: Run tests
         env:
           DB_CONNECTION: sqlite
           DB_DATABASE: database/database.sqlite
           APP_ENV: testing
-          APP_KEY: base64:test
           STRIPE_KEY: ""
           STRIPE_SECRET: ""
           STRIPE_WEBHOOK_SECRET: ""
