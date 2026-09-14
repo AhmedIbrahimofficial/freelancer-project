@@ -1,5 +1,5 @@
 [build]
-buildCommand = "composer install --no-dev --optimize-autoloader --no-interaction --ignore-platform-req=ext-imagick --ignore-platform-req=ext-exif && php artisan config:cache && php artisan route:cache && php artisan view:cache && php artisan migrate --force"
+buildCommand = "composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --ignore-platform-req=ext-exif --ignore-platform-req=ext-imagick --ignore-platform-req=php && php artisan package:discover --ansi && php artisan config:cache && php artisan route:cache && php artisan view:cache && php artisan migrate --force"
 
 [deploy]
 startCommand = "php artisan serve --host=0.0.0.0 --port=$PORT"

@@ -37,7 +37,7 @@ jobs:
           restore-keys: ${{ runner.os }}-php8.3-composer-
 
       - name: Install Composer dependencies
-        run: composer install --prefer-dist --no-interaction --no-progress
+        run: composer install --prefer-dist --no-interaction --no-progress --ignore-platform-req=ext-exif --ignore-platform-req=ext-imagick
 
       - name: Prepare Laravel application
         run: |
