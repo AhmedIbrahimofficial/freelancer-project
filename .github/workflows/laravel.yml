@@ -29,13 +29,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.json') }}
           restore-keys: ${{ runner.os }}-composer-
 
-      - name: Install Composer dependencies
-        run: composer install --prefer-dist --no-interaction --no-progress --no-scripts --ignore-platform-reqs
-        # --ignore-platform-reqs bypasses ALL PHP version and extension requirements in composer.lock
-      - name: Run post-install scripts
+      - name: Resolve dependencies (composer update — no lock file)
+        run: composer update --prefer-dist --no-interaction --no-progress --no-scripts --prefer-stable
+
+      - name: Run autoload and discovery
         run: |
           composer dump-autoload --optimize
           php artisan package:discover --ansi || true
