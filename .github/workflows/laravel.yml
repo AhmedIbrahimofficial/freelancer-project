@@ -34,6 +34,7 @@ jobs:
 
       - name: Install Composer dependencies
         run: composer install --prefer-dist --no-interaction --no-progress --no-scripts --ignore-platform-reqs
+        # --ignore-platform-reqs bypasses ALL PHP version and extension requirements in composer.lock
 
       - name: Run post-install scripts
         run: |
