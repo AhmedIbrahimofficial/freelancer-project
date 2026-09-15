@@ -1,0 +1,13 @@
+{
+  "builders": [
+    {
+      "name": "php",
+      "options": {
+        "phpVersion": "8.3"
+      }
+    }
+  ],
+  "buildCommand": "composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --ignore-platform-reqs && composer dump-autoload --optimize && php artisan package:discover --ansi || true && php artisan config:cache && php artisan route:cache && php artisan view:cache",
+  "startCommand": "php artisan serve --host=0.0.0.0 --port=$PORT",
+  "ignoredDirectories": ["secure-milestone-hub"]
+}
