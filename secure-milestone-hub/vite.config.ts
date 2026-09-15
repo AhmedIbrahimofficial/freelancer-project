@@ -8,11 +8,7 @@ import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
   tanstackStart: {
-    // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
-    // nitro/vite builds from this
     server: { entry: "server" },
-    // Use node-server preset for Railway/Node.js deployment.
-    // Override NITRO_PRESET=cloudflare-pages for Cloudflare deployment.
     ...(process.env.NITRO_PRESET ? {} : { nitro: { preset: "node-server" } }),
   },
 });
