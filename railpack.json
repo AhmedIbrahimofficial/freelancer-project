@@ -1,13 +1,27 @@
 {
-  "builders": [
-    {
-      "name": "php",
-      "options": {
-        "phpVersion": "8.3"
-      }
+  "phases": {
+    "extensions": {
+      "cmds": [
+        "install-php-extensions ctype curl dom exif fileinfo filter gd hash mbstring openssl pcre pdo pdo_mysql session tokenizer xml zip"
+      ]
+    },
+    "install": {
+      "cmds": [
+        "composer install --no-dev --optimize-autoloader --no-scripts --no-interaction --ignore-platform-req=ext-exif --ignore-platform-req=ext-imagick"
+      ]
+    },
+    "build": {
+      "cmds": [
+        "composer dump-autoload --optimize",
+        "php artisan package:discover --ansi || true",
+        "php artisan config:cache",
+        "php artisan route:cache",
+        "php artisan view:cache",
+        "php artisan migrate --force"
+      ]
     }
-  ],
-  "buildCommand": "composer install --no-dev --optimize-autoloader --no-interaction --no-scripts --ignore-platform-reqs && composer dump-autoload --optimize && php artisan package:discover --ansi || true && php artisan config:cache && php artisan route:cache && php artisan view:cache",
-  "startCommand": "php artisan serve --host=0.0.0.0 --port=$PORT",
-  "ignoredDirectories": ["secure-milestone-hub"]
+  },
+  "deploy": {
+    "startCommand": "php artisan serve --host=0.0.0.0 --port=$PORT"
+  }
 }
