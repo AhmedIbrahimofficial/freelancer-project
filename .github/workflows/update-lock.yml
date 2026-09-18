@@ -26,6 +26,7 @@ jobs:
 
       - name: Run composer update
         run: composer update --prefer-dist --no-interaction --no-progress --prefer-stable --no-scripts
+        # Triggered: remove spatie/laravel-medialibrary (ext-exif conflict)
 
       - name: Commit and push composer.lock
         run: |

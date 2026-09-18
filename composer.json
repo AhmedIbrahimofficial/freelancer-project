@@ -13,7 +13,6 @@
         "laravel/tinker": "^3.0",
         "pusher/pusher-php-server": "^7.2",
         "spatie/laravel-activitylog": "^4.9",
-        "spatie/laravel-medialibrary": "^11.11",
         "spatie/laravel-permission": "^6.10",
         "stripe/stripe-php": "^16.4"
     },
